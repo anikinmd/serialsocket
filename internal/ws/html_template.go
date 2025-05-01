@@ -233,8 +233,8 @@ const terminalHTML = `<!DOCTYPE html>
             
             // Special handling for control characters
             if (code === 13) {  // Enter key
-                // Send CR+LF to the device
-                sendData(new Uint8Array([13, 10]));
+                // Send CR to the device
+                sendData(new Uint8Array([13]));
             } else if (code === 127 || code === 8) {  // Backspace/Delete
                 // Handle backspace - most terminals send a backspace character
                 sendData(new Uint8Array([8]));
