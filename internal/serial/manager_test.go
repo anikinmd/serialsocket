@@ -37,15 +37,33 @@ func TestRun_ImmediateCancel(t *testing.T) {
 	// When context is already canceled, Run should return nil immediately
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	mgr := NewManager("/dev/nonexistent", 9600)
+
+	// Add buffer size parameter to NewManager call
+	mgr := NewManager("/dev/nonexistent", 9600, 4096)
 	err := mgr.Run(ctx, make(chan []byte), make(chan []byte))
 	require.NoError(t, err)
 }
 
 func TestOpenPort_InvalidDevice(t *testing.T) {
-	m := NewManager("/dev/nonexistent", 9600).(*manager)
+	m := NewManager("/dev/nonexistent", 9600, 4096).(*manager)
 	_, err := m.openPort()
 	require.Error(t, err)
+}
+
+func TestBufferPool(t *testing.T) {
+	bufSize := 1024
+	m := NewManager("/dev/test", 9600, bufSize).(*manager)
+
+	// Get a buffer from the pool and verify its size
+	buf := m.bufferPool.Get().([]byte)
+	require.Equal(t, bufSize, len(buf))
+
+	// Put it back and get another to confirm reuse
+	m.bufferPool.Put(buf)
+	buf2 := m.bufferPool.Get().([]byte)
+
+	// Cannot guarantee the same buffer is returned, but size should match
+	require.Equal(t, bufSize, len(buf2))
 }
 
 func TestMockPort_Write(t *testing.T) {

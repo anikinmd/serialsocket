@@ -18,12 +18,18 @@ type Server interface {
 
 // NewServer creates a WS server on wsPort with CORS allowOrigin
 func NewServer(wsPort int, allowOrigin string) Server {
-	return &server{wsPort: wsPort, allowOrigin: allowOrigin}
+	return &server{
+		wsPort:      wsPort,
+		allowOrigin: allowOrigin,
+		clients:     make(map[*websocket.Conn]bool), // Track active status
+	}
 }
 
 type server struct {
 	wsPort      int
 	allowOrigin string
+	clients     map[*websocket.Conn]bool
+	mu          sync.RWMutex
 }
 
 func (s *server) Run(ctx context.Context, serialRx <-chan []byte, serialTx chan<- []byte) error {
@@ -38,9 +44,6 @@ func (s *server) Run(ctx context.Context, serialRx <-chan []byte, serialTx chan<
 		},
 	}
 
-	clients := make(map[*websocket.Conn]struct{})
-	var mu sync.RWMutex
-
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
@@ -48,20 +51,50 @@ func (s *server) Run(ctx context.Context, serialRx <-chan []byte, serialTx chan<
 			log.Error().Err(err).Msg("WebSocket upgrade failed")
 			return
 		}
-		mu.Lock()
-		clients[conn] = struct{}{}
-		mu.Unlock()
+
+		// Configure WebSocket for performance
+		conn.SetReadLimit(4096) // Limit max message size
+		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		conn.SetPongHandler(func(string) error {
+			conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+			return nil
+		})
+
+		s.mu.Lock()
+		s.clients[conn] = true
+		s.mu.Unlock()
+
 		log.Info().Str("remote", conn.RemoteAddr().String()).Msg("Client connected")
 
 		go func() {
 			defer func() {
-				mu.Lock()
-				delete(clients, conn)
-				mu.Unlock()
+				s.mu.Lock()
+				delete(s.clients, conn)
+				s.mu.Unlock()
 				conn.Close()
 				log.Info().Str("remote", conn.RemoteAddr().String()).Msg("Client disconnected")
 			}()
+
+			// Start a ping ticker
+			ticker := time.NewTicker(30 * time.Second)
+			defer ticker.Stop()
+
+			go func() {
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case <-ticker.C:
+						conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+						if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+							return
+						}
+					}
+				}
+			}()
+
 			for {
+				conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 				_, msg, err := conn.ReadMessage()
 				if err != nil {
 					if websocket.IsUnexpectedCloseError(err,
@@ -70,8 +103,11 @@ func (s *server) Run(ctx context.Context, serialRx <-chan []byte, serialTx chan<
 					}
 					return
 				}
+
+				// Only send message if serialTx has room
 				select {
 				case serialTx <- msg:
+					// Message sent successfully
 				default:
 					log.Warn().Msg("Serial TX buffer full, dropping data")
 				}
@@ -93,30 +129,62 @@ func (s *server) Run(ctx context.Context, serialRx <-chan []byte, serialTx chan<
 		w.Write([]byte("OK"))
 	})
 
-	srv := &http.Server{Addr: fmt.Sprintf(":%d", s.wsPort), Handler: mux}
+	srv := &http.Server{
+		Addr:         fmt.Sprintf(":%d", s.wsPort),
+		Handler:      mux,
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 15 * time.Second,
+	}
+
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Error().Err(err).Msg("WebSocket server error")
 		}
 	}()
+
 	log.Info().Int("port", s.wsPort).Msg("Starting WebSocket server")
 
-	// Broadcast loop
+	// Broadcast loop - optimized for small number of clients
+	// No need for per-client goroutines with only 2-3 clients
 	go func() {
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case data := <-serialRx:
-				mu.RLock()
-				for c := range clients {
-					go func(c *websocket.Conn, d []byte) {
-						if err := c.WriteMessage(websocket.BinaryMessage, d); err != nil {
-							log.Error().Err(err).Msg("WebSocket write error")
-						}
-					}(c, data)
+				if len(data) == 0 {
+					continue
 				}
-				mu.RUnlock()
+
+				// Efficient broadcasting with minimal locking
+				s.mu.RLock()
+				clientCount := len(s.clients)
+				if clientCount == 0 {
+					s.mu.RUnlock()
+					continue
+				}
+
+				// For small number of clients, we broadcast directly without spawning goroutines
+				for c, active := range s.clients {
+					if !active {
+						continue
+					}
+
+					c.SetWriteDeadline(time.Now().Add(5 * time.Second))
+					if err := c.WriteMessage(websocket.BinaryMessage, data); err != nil {
+						log.Error().Err(err).Msg("WebSocket write error")
+						// Mark client for cleanup
+						s.mu.RUnlock()
+						s.mu.Lock()
+						s.clients[c] = false
+						s.mu.Unlock()
+						s.mu.RLock()
+					}
+				}
+				s.mu.RUnlock()
+
+				// Clean up inactive clients occasionally
+				go s.cleanupInactiveClients()
 			}
 		}
 	}()
@@ -126,4 +194,17 @@ func (s *server) Run(ctx context.Context, serialRx <-chan []byte, serialTx chan<
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	return srv.Shutdown(shutdownCtx)
+}
+
+// Cleanup routine for removing inactive clients
+func (s *server) cleanupInactiveClients() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for c, active := range s.clients {
+		if !active {
+			delete(s.clients, c)
+			c.Close()
+		}
+	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"os/signal"
+	"runtime"
 	"sync"
 	"syscall"
 	"time"
@@ -20,12 +21,23 @@ func main() {
 	cfg := config.New()
 	cfg.SetupLogger()
 
-	// Channels for serial ↔ websocket
-	serialRx := make(chan []byte, 1024)
-	serialTx := make(chan []byte, 1024)
+	// Set GOMAXPROCS to limit CPU usage if needed
+	// Uncomment and adjust if you want to limit CPU usage
+	// runtime.GOMAXPROCS(2)
 
-	// Instantiate components
-	serialMgr := serial.NewManager(cfg.Device, cfg.Baud)
+	// Enable GC tuning for better performance under constant load
+	// This helps reduce GC pauses for continuous data streams
+	// - 10000 reduces GC frequency - better for high-throughput UART data
+	// - 10 gives more time to GC, which helps under high load
+	os.Setenv("GOGC", "10000")
+	os.Setenv("GODEBUG", "gctrace=0")
+
+	// Channels for serial ↔ websocket with configurable sizes
+	serialRx := make(chan []byte, cfg.ChannelSize)
+	serialTx := make(chan []byte, cfg.ChannelSize)
+
+	// Instantiate optimized components
+	serialMgr := serial.NewManager(cfg.Device, cfg.Baud, cfg.SerialBufferSize)
 	wsServer := ws.NewServer(cfg.WSPort, cfg.AllowOrigin)
 
 	// Run
@@ -33,6 +45,18 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// Log system info
+	log.Info().
+		Int("go_routines", runtime.NumGoroutine()).
+		Int("cpus", runtime.NumCPU()).
+		Str("device", cfg.Device).
+		Int("baud", cfg.Baud).
+		Int("ws-port", cfg.WSPort).
+		Int("buffer_size", cfg.SerialBufferSize).
+		Int("channel_size", cfg.ChannelSize).
+		Msg("Serial WebSocket Bridge starting")
+
+	// Run serial manager
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -41,6 +65,7 @@ func main() {
 		}
 	}()
 
+	// Run WebSocket server
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -49,11 +74,26 @@ func main() {
 		}
 	}()
 
-	log.Info().
-		Str("device", cfg.Device).
-		Int("baud", cfg.Baud).
-		Int("ws-port", cfg.WSPort).
-		Msg("Serial WebSocket Bridge started")
+	// Periodically log system metrics
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(60 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				log.Debug().
+					Int("goroutines", runtime.NumGoroutine()).
+					Int("rx_channel_len", len(serialRx)).
+					Int("tx_channel_len", len(serialTx)).
+					Msg("System metrics")
+			}
+		}
+	}()
 
 	// Graceful shutdown
 	sigCh := make(chan os.Signal, 1)

@@ -1,0 +1,453 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Serial Terminal</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.1.0/css/xterm.min.css" />
+    <script src="https://cdn.jsdelivr.net/npm/xterm@5.1.0/lib/xterm.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.7.0/lib/xterm-addon-fit.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xterm-addon-web-links@0.8.0/lib/xterm-addon-web-links.min.js"></script>
+    <!-- Add WebGL renderer for much better performance -->
+    <script src="https://cdn.jsdelivr.net/npm/xterm-addon-webgl@0.15.0/lib/xterm-addon-webgl.min.js"></script>
+    <style>
+        html, body {
+            margin: 0;
+            padding: 0;
+            height: 100%;
+            width: 100%;
+            font-family: 'Menlo', 'DejaVu Sans Mono', 'Consolas', monospace;
+            background-color: #1e1e1e;
+            color: #f0f0f0;
+            overflow: hidden;
+            will-change: transform; /* Hardware acceleration hint */
+        }
+        
+        body {
+            display: flex;
+            flex-direction: column;
+            overscroll-behavior: none; /* Prevent overscroll bounce effects */
+        }
+        
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background-color: #2d2d2d;
+            padding: 4px 8px;
+            border-bottom: 1px solid #3e3e3e;
+            height: 32px;
+            will-change: transform;
+            z-index: 10;
+        }
+        
+        .title {
+            font-size: 14px;
+            font-weight: bold;
+            color: #f0f0f0;
+            white-space: nowrap;
+        }
+        
+        .controls {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+        }
+        
+        .status {
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            background-color: #5a1e1e;
+            white-space: nowrap;
+        }
+        
+        .connected {
+            background-color: #1e5a1e;
+        }
+        
+        .connecting {
+            background-color: #5a5a1e;
+        }
+        
+        .button {
+            padding: 4px 8px;
+            border-radius: 4px;
+            background-color: #3e3e3e;
+            border: none;
+            color: #f0f0f0;
+            font-size: 12px;
+            cursor: pointer;
+            will-change: transform;
+            transition: background-color 0.2s;
+            white-space: nowrap;
+            touch-action: manipulation;
+        }
+        
+        .button:hover {
+            background-color: #4e4e4e;
+        }
+        
+        .terminal-container {
+            flex: 1;
+            padding: 4px;
+            background-color: #1e1e1e;
+            overflow: hidden;
+            position: relative;
+            will-change: transform;
+        }
+        
+        #terminal {
+            width: 100%;
+            height: 100%;
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            padding: 4px;
+            box-sizing: border-box;
+        }
+        
+        /* Optimize scrollbars */
+        ::-webkit-scrollbar {
+            width: 8px;
+            height: 8px;
+        }
+        
+        ::-webkit-scrollbar-track {
+            background: #2d2d2d;
+        }
+        
+        ::-webkit-scrollbar-thumb {
+            background: #4e4e4e;
+            border-radius: 4px;
+        }
+        
+        ::-webkit-scrollbar-thumb:hover {
+            background: #5e5e5e;
+        }
+        
+        /* Optimize for mobile */
+        @media (max-width: 600px) {
+            .controls {
+                flex-wrap: wrap;
+            }
+            
+            .header {
+                height: auto;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="title">Serial Terminal</div>
+        <div class="controls">
+            <div id="status" class="status">Disconnected</div>
+            <button id="clearBtn" class="button">Clear</button>
+            <button id="hexModeBtn" class="button">Hex Mode: Off</button>
+            <button id="localEchoBtn" class="button">Local Echo: Off</button>
+        </div>
+    </div>
+    
+    <div class="terminal-container">
+        <div id="terminal"></div>
+    </div>
+    
+    <script>
+        // Performance optimization variables
+        const BUFFER_SIZE = 8192; // Optimal buffer size
+        const RENDER_THROTTLE = 16; // ~60fps (1000ms / 60fps ≈ 16ms)
+        let lastRenderTime = 0;
+        let pendingData = [];
+        let pendingDataSize = 0;
+        let reconnectAttempts = 0;
+        let reconnectDelay = 1000; // Start with 1s delay
+        const MAX_RECONNECT_DELAY = 30000; // Max 30s delay
+        
+        // Terminal setup with optimized options
+        const term = new Terminal({
+            cursorBlink: true,
+            fontSize: 14,
+            fontFamily: 'Menlo, "DejaVu Sans Mono", Consolas, monospace',
+            theme: {
+                background: '#1e1e1e',
+                foreground: '#f0f0f0',
+                cursor: '#f0f0f0',
+                selectionBackground: '#4e4e4e'
+            },
+            scrollback: 5000,
+            convertEol: true,
+            allowTransparency: false, // Performance improvement
+            fastScrollModifier: 'alt', // Allow fast scrolling with Alt key
+            minimumContrastRatio: 1 // Reduce contrast calculations
+        });
+        
+        // Terminal addons
+        const fitAddon = new FitAddon.FitAddon();
+        const webLinksAddon = new WebLinksAddon.WebLinksAddon();
+        
+        // Add WebGL renderer for significantly better performance
+        let webglAddon;
+        try {
+            webglAddon = new WebGLAddon.WebGLAddon();
+            term.loadAddon(webglAddon);
+            console.log('WebGL renderer enabled');
+        } catch (e) {
+            console.warn('WebGL renderer not available, falling back to canvas:', e);
+        }
+        
+        // Apply addons
+        term.loadAddon(fitAddon);
+        term.loadAddon(webLinksAddon);
+        
+        // Open terminal
+        term.open(document.getElementById('terminal'));
+        
+        // Optimize terminal size calculation
+        let resizeTimeout;
+        function optimizedResize() {
+            if (resizeTimeout) {
+                clearTimeout(resizeTimeout);
+            }
+            
+            resizeTimeout = setTimeout(() => {
+                fitAddon.fit();
+            }, 100);
+        }
+        
+        // Handle window resize with debounce
+        window.addEventListener('resize', optimizedResize);
+        
+        // Initial resize
+        setTimeout(() => {
+            fitAddon.fit();
+        }, 0);
+        
+        // Status and control elements with cached references
+        const status = document.getElementById('status');
+        const clearBtn = document.getElementById('clearBtn');
+        const hexModeBtn = document.getElementById('hexModeBtn');
+        const localEchoBtn = document.getElementById('localEchoBtn');
+        
+        // Variables
+        let ws = null;
+        let hexMode = false;
+        let localEcho = false;
+        let connected = false;
+        let textDecoder = new TextDecoder('utf-8');
+        let textEncoder = new TextEncoder();
+        
+        // Wait for terminal to initialize before showing welcome message
+        requestAnimationFrame(() => {
+            // Use direct ANSI escape sequences for colors
+            term.write('\r\n\u001B[1;33mSerial Terminal - Xterm.js Emulation\u001B[0m\r\n');
+            term.write('\u001B[32m• Type commands and press Enter to send\r\n');
+            term.write('• Press Ctrl+C to interrupt\r\n');
+            term.write('• Toggle Hex Mode for binary data\r\n');
+            term.write('• Toggle Local Echo for input visibility\u001B[0m\r\n\r\n');
+            
+            // Focus terminal after welcome message
+            term.focus();
+        });
+        
+        // Efficient rendering function with throttling
+        function renderData() {
+            const now = performance.now();
+            
+            // Throttle rendering for better performance
+            if (pendingData.length > 0 && (now - lastRenderTime >= RENDER_THROTTLE || pendingDataSize > BUFFER_SIZE)) {
+                let dataToRender;
+                
+                if (hexMode) {
+                    // Optimize hex mode rendering by pre-processing
+                    dataToRender = '\u001B[34m'; // Blue color
+                    
+                    // Process all pending data chunks at once
+                    const hexParts = [];
+                    for (let i = 0; i < pendingData.length; i++) {
+                        const data = pendingData[i];
+                        const hexChunks = [];
+                        
+                        for (let j = 0; j < data.length; j++) {
+                            hexChunks.push(data[j].toString(16).padStart(2, '0'));
+                        }
+                        
+                        hexParts.push(hexChunks.join(' '));
+                    }
+                    
+                    dataToRender += hexParts.join(' ') + '\u001B[0m'; // Reset color
+                } else {
+                    // Convert binary data to text efficiently
+                    // Merge Uint8Arrays before decoding for better performance
+                    const totalLength = pendingData.reduce((acc, chunk) => acc + chunk.length, 0);
+                    const mergedArray = new Uint8Array(totalLength);
+                    
+                    let offset = 0;
+                    for (const chunk of pendingData) {
+                        mergedArray.set(chunk, offset);
+                        offset += chunk.length;
+                    }
+                    
+                    dataToRender = textDecoder.decode(mergedArray);
+                }
+                
+                // Write to terminal in one operation
+                term.write(dataToRender);
+                
+                // Reset buffer
+                pendingData = [];
+                pendingDataSize = 0;
+                lastRenderTime = now;
+            }
+            
+            // Continue the render loop
+            requestAnimationFrame(renderData);
+        }
+        
+        // Start the render loop
+        requestAnimationFrame(renderData);
+        
+        // Connect to WebSocket with exponential backoff
+        function connect() {
+            if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) {
+                return; // Already connecting or connected
+            }
+            
+            const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = wsProtocol + '//' + window.location.host + '/ws';
+            
+            status.textContent = 'Connecting...';
+            status.className = 'status connecting';
+            
+            ws = new WebSocket(wsUrl);
+            ws.binaryType = 'arraybuffer';
+            
+            ws.onopen = () => {
+                status.textContent = 'Connected';
+                status.className = 'status connected';
+                term.writeln('\r\n\u001B[32mConnected to serial port\u001B[0m');
+                connected = true;
+                reconnectAttempts = 0;
+                reconnectDelay = 1000; // Reset reconnect delay
+            };
+            
+            ws.onclose = (event) => {
+                status.textContent = 'Disconnected';
+                status.className = 'status';
+                if (connected) {
+                    term.writeln('\r\n\u001B[31mDisconnected from serial port\u001B[0m');
+                    connected = false;
+                }
+                
+                // Exponential backoff for reconnection
+                reconnectDelay = Math.min(MAX_RECONNECT_DELAY, reconnectDelay * (1.5 + Math.random() * 0.5));
+                reconnectAttempts++;
+                
+                // Try to reconnect after delay
+                setTimeout(connect, reconnectDelay);
+            };
+            
+            ws.onerror = (error) => {
+                if (connected) {
+                    term.writeln('\r\n\u001B[31mConnection error\u001B[0m');
+                }
+            };
+            
+            ws.onmessage = (event) => {
+                const data = new Uint8Array(event.data);
+                
+                // Add to buffer instead of rendering immediately
+                pendingData.push(data);
+                pendingDataSize += data.length;
+            };
+        }
+        
+        // Send data to serial port with error handling
+        function sendData(data) {
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                term.writeln('\r\n\u001B[31mNot connected!\u001B[0m');
+                return;
+            }
+            
+            try {
+                ws.send(data);
+            } catch (e) {
+                term.writeln(`\r\n\u001B[31mFailed to send data: ${e.message}\u001B[0m`);
+            }
+        }
+        
+        // Optimize input handling
+        term.onData(data => {
+            const code = data.charCodeAt(0);
+            
+            // Only print character if local echo is on
+            if (localEcho) {
+                term.write(data);
+            }
+            
+            // Special handling for control characters
+            if (code === 13) {  // Enter key
+                // Send CR to the device
+                sendData(new Uint8Array([13]));
+            } else if (code === 127 || code === 8) {  // Backspace/Delete
+                // Handle backspace - most terminals send a backspace character
+                sendData(new Uint8Array([8]));
+            } else if (code === 3) {  // Ctrl+C
+                // Send ETX character (End of Text, ASCII 3)
+                sendData(new Uint8Array([3]));
+            } else {
+                // For normal characters, just send the raw data
+                sendData(textEncoder.encode(data));
+            }
+        });
+        
+        // Optimize event listeners with passive option where possible
+        clearBtn.addEventListener('click', () => {
+            term.clear();
+        }, { passive: true });
+        
+        hexModeBtn.addEventListener('click', () => {
+            hexMode = !hexMode;
+            hexModeBtn.textContent = 'Hex Mode: ' + (hexMode ? 'On' : 'Off');
+            term.writeln('\r\n\u001B[33mHex Mode ' + (hexMode ? 'Enabled' : 'Disabled') + '\u001B[0m');
+            
+            // Clear pending data when changing modes
+            pendingData = [];
+            pendingDataSize = 0;
+        }, { passive: true });
+        
+        localEchoBtn.addEventListener('click', () => {
+            localEcho = !localEcho;
+            localEchoBtn.textContent = 'Local Echo: ' + (localEcho ? 'On' : 'Off');
+            term.writeln('\r\n\u001B[33mLocal Echo ' + (localEcho ? 'Enabled' : 'Disabled') + '\u001B[0m');
+        }, { passive: true });
+        
+        // Add visibility change handling to improve performance when tab is not visible
+        let renderThrottle = RENDER_THROTTLE;
+        document.addEventListener('visibilitychange', () => {
+            if (document.hidden) {
+                // Increase throttle when tab is not visible
+                renderThrottle = 100; // 10fps
+            } else {
+                // Reset to normal when tab is visible again
+                renderThrottle = RENDER_THROTTLE; // ~60fps
+                
+                // Force a resize to ensure terminal fits correctly
+                setTimeout(() => {
+                    fitAddon.fit();
+                }, 100);
+            }
+        }, { passive: true });
+        
+        // Initial connection
+        connect();
+        
+        // Initial focus
+        window.addEventListener('load', () => {
+            term.focus();
+        }, { passive: true });
+    </script>
+</body>
+</html>

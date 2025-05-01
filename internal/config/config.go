@@ -11,12 +11,14 @@ import (
 
 // Config holds CLI and env settings
 type Config struct {
-	Device      string
-	Baud        int
-	WSPort      int
-	AllowOrigin string
-	LogLevel    string
-	LogFormat   string
+	Device           string
+	Baud             int
+	WSPort           int
+	AllowOrigin      string
+	LogLevel         string
+	LogFormat        string
+	SerialBufferSize int // New: Serial read buffer size
+	ChannelSize      int // New: Size for RX/TX channels
 }
 
 // New parses flags and environment variables
@@ -28,6 +30,11 @@ func New() *Config {
 	flag.StringVar(&cfg.AllowOrigin, "allow-origin", "*", "Allowed origins for CORS")
 	flag.StringVar(&cfg.LogLevel, "log-level", "info", "Log level (debug, info, warn, error)")
 	flag.StringVar(&cfg.LogFormat, "log-format", "json", "Log format (json or console)")
+
+	// New optimized parameters
+	flag.IntVar(&cfg.SerialBufferSize, "serial-buffer", 4096, "Serial read buffer size")
+	flag.IntVar(&cfg.ChannelSize, "channel-size", 4096, "Size for internal communication channels")
+
 	flag.Parse()
 
 	// Override with env vars if set
@@ -49,12 +56,27 @@ func New() *Config {
 	if env := os.Getenv("SERIAL_WS_LOG_FORMAT"); env != "" {
 		cfg.LogFormat = env
 	}
+	if env := os.Getenv("SERIAL_WS_BUFFER_SIZE"); env != "" {
+		fmt.Sscanf(env, "%d", &cfg.SerialBufferSize)
+	}
+	if env := os.Getenv("SERIAL_WS_CHANNEL_SIZE"); env != "" {
+		fmt.Sscanf(env, "%d", &cfg.ChannelSize)
+	}
 
-	// Validate
+	// Validate required parameters
 	if cfg.Device == "" || cfg.Baud <= 0 || cfg.WSPort <= 0 || cfg.WSPort > 65535 {
 		flag.Usage()
 		log.Fatal().Msg("missing or invalid required parameters")
 	}
+
+	// Validate optimization parameters
+	if cfg.SerialBufferSize <= 0 {
+		cfg.SerialBufferSize = 4096 // Default to 4K if invalid
+	}
+	if cfg.ChannelSize <= 0 {
+		cfg.ChannelSize = 4096 // Default to 4K if invalid
+	}
+
 	return cfg
 }
 
